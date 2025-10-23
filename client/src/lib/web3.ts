@@ -69,17 +69,19 @@ export const SCORE_STORE_ABI = [
 ] as const;
 
 const MONAD_RPC_URL = import.meta.env.VITE_MONAD_RPC || "https://rpc.ankr.com/monad_testnet";
-const ALCHEMY_API_KEY = import.meta.env.VITE_ALCHEMY_API_KEY || "";
+const ZERODEV_PROJECT_ID = import.meta.env.VITE_ZERODEV_PROJECT_ID || "";
+const ENVIO_API_KEY = import.meta.env.ENVIO_API_KEY || "";
 
-// Validate Alchemy API key on init
-if (ALCHEMY_API_KEY) {
-  console.log("Alchemy API Key loaded:", ALCHEMY_API_KEY.substring(0, 8) + "...");
+// Validate ZeroDev project ID on init
+if (ZERODEV_PROJECT_ID) {
+  console.log("ZeroDev Project ID loaded:", ZERODEV_PROJECT_ID.substring(0, 8) + "...");
 } else {
-  console.warn("VITE_ALCHEMY_API_KEY not set - Smart Account transactions will fail");
+  console.warn("VITE_ZERODEV_PROJECT_ID not set - Gasless transactions will not work");
 }
 
-const BUNDLER_URL = ALCHEMY_API_KEY
-  ? `https://monad-testnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`
+// ZeroDev RPC with selfFunded=true (smart wallet pays with its own MON tokens)
+const BUNDLER_URL = ZERODEV_PROJECT_ID
+  ? `https://rpc.zerodev.app/api/v3/${ZERODEV_PROJECT_ID}/chain/${MONAD_TESTNET.id}?selfFunded=true`
   : "";
 
 export const publicClient = createPublicClient({
@@ -174,6 +176,31 @@ export function getCurrentSmartAccountAddress(): Address | null {
   return currentSmartAccountAddress;
 }
 
+export function getCurrentEOAAddress(): Address | null {
+  return currentEOAAddress;
+}
+
+// Fetch EOA balance
+// Note: For comprehensive balance data with Envio HyperSync, use WalletBalanceCard component
+// which accesses server-side Envio integration at /api/balance/${address}
+export async function getEOABalance(address?: Address): Promise<bigint> {
+  const targetAddress = address || currentEOAAddress;
+  
+  if (!targetAddress) {
+    throw new Error("No address provided");
+  }
+
+  try {
+    const balance = await publicClient.getBalance({ address: targetAddress });
+    console.log(`EOA Balance (${targetAddress}):`, balance.toString(), "wei");
+    return balance;
+  } catch (error) {
+    console.error("Error fetching EOA balance:", error);
+    // Return 0 on error rather than throwing
+    return BigInt(0);
+  }
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -203,115 +230,132 @@ async function saveScoreViaSmartAccount(
   }
 
   if (!BUNDLER_URL) {
-    throw new Error("Bundler not configured");
+    throw new Error("Bundler not configured - ZeroDev Project ID missing");
   }
 
-  console.log("🚀 Starting Smart Account transaction...");
+  console.log("🚀 Starting Smart Account gasless transaction...");
   console.log("   Smart Account:", currentSmartAccountAddress);
-  console.log("   Bundler:", BUNDLER_URL.substring(0, 50) + "...");
+  console.log("   ZeroDev Bundler:", BUNDLER_URL.substring(0, 60) + "...");
   console.log("   Score:", score);
+  console.log("   Gas: Sponsored by smart wallet (selfFunded=true)");
 
   const startTime = Date.now();
+  const TIMEOUT_MS = 90000; // 90 seconds total timeout for ZeroDev bundler
   let progressInterval: any = null;
 
   if (onProgress) {
-    onProgress("Preparing Smart Account transaction...", 0);
+    onProgress("Preparing gasless transaction...", 0);
     progressInterval = setInterval(() => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      onProgress(`Processing Smart Account... (${elapsed}s)`, elapsed);
+      onProgress(`Processing gasless transaction... (${elapsed}s)`, elapsed);
     }, 1000);
   }
 
   try {
-    // Create bundler client with proper configuration
-    console.log("Creating bundler client...");
+    // Create bundler client with ZeroDev RPC
+    // ZeroDev's selfFunded=true parameter automatically handles gas sponsorship from the smart wallet
+    console.log("Creating ZeroDev bundler client...");
     const bundlerClient = createBundlerClient({
       client: publicClient,
       transport: http(BUNDLER_URL, {
-        timeout: 30000, // 30 second timeout
-        retryCount: 1,
-        retryDelay: 100,
+        timeout: TIMEOUT_MS,
+        retryCount: 2,
+        retryDelay: 1000,
       }),
     });
 
     if (onProgress) {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      onProgress("Submitting to Alchemy bundler...", elapsed);
+      onProgress("Submitting to ZeroDev bundler...", elapsed);
     }
 
-    console.log("Submitting user operation...");
+    console.log("Preparing user operation...");
 
-    // Submit the user operation
-    const userOpHash = await bundlerClient.sendUserOperation({
-      account: currentSmartAccount,
-      calls: [
-        {
-          to: CONTRACT_ADDRESS,
-          abi: SCORE_STORE_ABI,
-          functionName: "saveScore",
-          args: [BigInt(score)],
-        },
-      ],
-    });
+    // Wrap the entire operation with timeout
+    const executeTransaction = async () => {
+      // Submit the user operation - ZeroDev bundler with selfFunded=true handles gas automatically
+      const userOpHash = await bundlerClient.sendUserOperation({
+        account: currentSmartAccount,
+        calls: [
+          {
+            to: CONTRACT_ADDRESS,
+            abi: SCORE_STORE_ABI,
+            functionName: "saveScore",
+            args: [BigInt(score)],
+          },
+        ],
+      });
 
-    console.log("✅ User operation sent:", userOpHash);
+      console.log("✅ User operation sent:", userOpHash);
 
-    if (onProgress) {
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      onProgress("Waiting for confirmation...", elapsed);
-    }
+      if (onProgress) {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        onProgress("Waiting for confirmation...", elapsed);
+      }
 
-    // Wait for the receipt with polling
-    console.log("Waiting for receipt...");
-    const maxWaitTime = 30000; // 30 seconds max
-    const pollInterval = 2000; // Poll every 2 seconds
-    const endTime = Date.now() + maxWaitTime;
+      // Wait for the receipt with polling
+      console.log("Waiting for receipt...");
+      const maxWaitTime = 60000; // 60 seconds max for receipt
+      const pollInterval = 2000; // Poll every 2 seconds
+      const endTime = Date.now() + maxWaitTime;
 
-    let receipt = null;
-    while (Date.now() < endTime) {
-      try {
-        receipt = await bundlerClient.getUserOperationReceipt({
-          hash: userOpHash,
-        });
+      let receipt = null;
+      while (Date.now() < endTime) {
+        try {
+          receipt = await bundlerClient.getUserOperationReceipt({
+            hash: userOpHash,
+          });
 
-        if (receipt) {
-          console.log("✅ Receipt received:", receipt);
-          break;
+          if (receipt) {
+            console.log("✅ Receipt received:", receipt);
+            break;
+          }
+        } catch (e: any) {
+          // Receipt not ready yet, continue polling
+          if (!e?.message?.includes("not found") && !e?.message?.includes("UserOperation not found")) {
+            console.warn("Receipt check error:", e?.message);
+          }
         }
-      } catch (e: any) {
-        // Receipt not ready yet, continue polling
-        if (!e?.message?.includes("not found")) {
-          console.warn("Receipt check error:", e?.message);
+
+        if (!receipt) {
+          await new Promise((resolve) => setTimeout(resolve, pollInterval));
+        }
+
+        if (onProgress && receipt) {
+          const elapsed = Math.floor((Date.now() - startTime) / 1000);
+          onProgress(`Confirming... (${elapsed}s)`, elapsed);
         }
       }
 
       if (!receipt) {
-        await new Promise((resolve) => setTimeout(resolve, pollInterval));
+        console.warn("Receipt not received after 60 seconds, but transaction may have succeeded");
+        // Return userOpHash as fallback - transaction may still succeed
+        return { hash: userOpHash, method: "smartAccount" as const };
       }
 
-      if (onProgress && receipt) {
-        const elapsed = Math.floor((Date.now() - startTime) / 1000);
-        onProgress(`Confirming... (${elapsed}s)`, elapsed);
-      }
-    }
+      const txHash = receipt.receipt?.transactionHash || userOpHash;
+      return { hash: txHash, method: "smartAccount" as const };
+    };
 
-    if (!receipt) {
-      throw new Error("Receipt not received after 30 seconds");
-    }
+    // Execute with overall timeout
+    const result = await withTimeout(
+      executeTransaction(),
+      TIMEOUT_MS,
+      "Smart Account transaction timeout after 90 seconds"
+    );
 
     if (progressInterval) {
       clearInterval(progressInterval);
     }
 
-    const txHash = receipt.receipt?.transactionHash || userOpHash;
-    console.log("✅ Smart Account transaction complete:", txHash);
+    console.log("✅ Smart Account gasless transaction complete:", result.hash);
 
     if (onProgress) {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       onProgress(`Success! (${elapsed}s)`, elapsed);
     }
 
-    return { hash: txHash, method: "smartAccount" };
+    return result;
   } catch (error: any) {
     if (progressInterval) {
       clearInterval(progressInterval);
@@ -325,6 +369,26 @@ async function saveScoreViaSmartAccount(
     }
     if (error?.response) {
       console.error("Error response:", error.response);
+    }
+    if (error?.details) {
+      console.error("Error details:", error.details);
+    }
+
+    // Check for specific error types
+    const errorMsg = error?.message || String(error);
+    
+    // If timeout, provide helpful message
+    if (error?.name === "TimeoutError" || errorMsg.includes("timeout")) {
+      const timeoutError = new Error("Transaction timed out - this may be due to network congestion. Please try again.");
+      (timeoutError as any).code = "TIMEOUT";
+      throw timeoutError;
+    }
+
+    // If insufficient funds in smart wallet
+    if (errorMsg.includes("insufficient") || errorMsg.includes("INSUFFICIENT")) {
+      const fundError = new Error("Smart wallet has insufficient MON tokens to pay gas fees");
+      (fundError as any).userFriendlyMessage = "Your Smart Account doesn't have enough MON to pay gas fees. Please fund it with more MON.";
+      throw fundError;
     }
 
     throw error;
@@ -399,18 +463,18 @@ export async function saveScoreToBlockchain(
   try {
     // Check if Smart Account and Bundler are properly configured
     const hasSmartAccount = !!currentSmartAccount;
-    const hasValidBundler = ALCHEMY_API_KEY && ALCHEMY_API_KEY.length > 0 && BUNDLER_URL;
+    const hasValidBundler = ZERODEV_PROJECT_ID && ZERODEV_PROJECT_ID.length > 0 && BUNDLER_URL;
 
     console.log("Transaction submission analysis:");
     console.log("- Smart Account available:", hasSmartAccount);
-    console.log("- Bundler URL available:", hasValidBundler);
-    console.log("- Using Smart Account:", hasSmartAccount && hasValidBundler);
+    console.log("- ZeroDev Bundler available:", hasValidBundler);
+    console.log("- Using Smart Account (gasless):", hasSmartAccount && hasValidBundler);
 
     // Attempt Smart Account transaction only if both conditions are met
     if (hasSmartAccount && hasValidBundler) {
-      console.log("Smart Account available, attempting transaction...");
-      console.log("API Key configured:", ALCHEMY_API_KEY.substring(0, 8) + "...");
-      console.log("Bundler URL:", BUNDLER_URL.substring(0, 40) + "...");
+      console.log("Smart Account available, attempting gasless transaction...");
+      console.log("ZeroDev Project ID configured:", ZERODEV_PROJECT_ID.substring(0, 8) + "...");
+      console.log("Bundler URL:", BUNDLER_URL.substring(0, 50) + "...");
 
       // Wrap Smart Account attempt with overall timeout
       try {
@@ -478,7 +542,7 @@ export async function saveScoreToBlockchain(
         console.log("Reason: Smart Account failed to initialize");
       }
       if (!hasValidBundler) {
-        console.log("Reason: Bundler not configured (missing VITE_ALCHEMY_API_KEY)");
+        console.log("Reason: ZeroDev bundler not configured (missing VITE_ZERODEV_PROJECT_ID)");
       }
       if (onProgress) {
         onProgress("Using EOA wallet for transaction...", 0);
