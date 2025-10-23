@@ -156,7 +156,7 @@ export default function Game() {
       } else {
         toast({
           title: "Success!",
-          description: "Score saved via Smart Account using Alchemy bundler!",
+          description: "Score saved via Smart Account using gasless transaction (ZeroDev)!",
           variant: "default",
         });
       }
